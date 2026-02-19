@@ -1,19 +1,22 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
 # =============================
-# Enhanced Multi-VM Manager
+# Binder VM Manager with Sudo
+# For mybinder.org environment
 # =============================
+
+# Configuration
+VM_DIR="${VM_DIR:-$HOME/binder-vms}"
+mkdir -p "$VM_DIR"
+FAKEROOT_DIR="$HOME/fakeroot-env"
 
 # Function to display header
 display_header() {
     clear
     cat << "EOF"
 ========================================================================
-Sponsor By These Guys!                                                                  
-HOPINGBOYZ
-Jishnu
-NotGamerPie
+Binder VM Manager with SUDO Access!
 ========================================================================
 EOF
     echo
@@ -34,851 +37,516 @@ print_status() {
     esac
 }
 
-# Function to validate input (password bisa apa aja)
-validate_input() {
-    local type=$1
-    local value=$2
+# Function to check and install fake sudo
+install_fake_sudo() {
+    if ! command -v fakeroot &> /dev/null; then
+        print_status "INFO" "Installing fakeroot for simulated sudo..."
+        pip install fakeroot --user 2>/dev/null || true
+        
+        # Try to install via apt if available (sometimes binder has apt)
+        if command -v apt-get &> /dev/null; then
+            apt-get update -qq && apt-get install -y fakeroot 2>/dev/null || true
+        fi
+    fi
     
-    case $type in
-        "number")
-            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-                print_status "ERROR" "Must be a number"
-                return 1
+    # Create fake sudo command
+    cat > "$HOME/bin/sudo" << 'EOF'
+#!/bin/bash
+# Fake sudo for binder environment
+if [[ "$1" == "apt" ]] || [[ "$1" == "apt-get" ]]; then
+    echo "Warning: Cannot install packages in binder"
+    echo "Using fakeroot simulation..."
+    fakeroot "$@"
+elif [[ "$1" == "useradd" ]] || [[ "$1" == "adduser" ]]; then
+    echo "Simulating user addition..."
+    # Actually create user in our namespace
+    if [[ "$1" == "useradd" ]]; then
+        shift
+        # Store user info in our fake passwd
+        echo "$@" >> "$HOME/.fake_users"
+    fi
+else
+    # Try to run with fakeroot
+    fakeroot "$@"
+fi
+EOF
+    chmod +x "$HOME/bin/sudo"
+    export PATH="$HOME/bin:$PATH"
+}
+
+# Function to create container with root access using PRoot
+setup_proot_env() {
+    local vm_name=$1
+    local distro=$2
+    
+    print_status "INFO" "Setting up PRoot environment for $vm_name..."
+    
+    # Install PRoot if not available
+    if ! command -v proot &> /dev/null; then
+        print_status "INFO" "Installing PRoot..."
+        wget -q https://proot.gitlab.io/proot/bin/proot -O "$HOME/bin/proot"
+        chmod +x "$HOME/bin/proot"
+    fi
+    
+    # Create rootfs directory
+    local rootfs="$VM_DIR/$vm_name/rootfs"
+    mkdir -p "$rootfs"
+    
+    # Download and extract rootfs based on distro
+    case $distro in
+        "ubuntu")
+            print_status "INFO" "Downloading Ubuntu base..."
+            if [[ ! -f "$VM_DIR/$vm_name/rootfs.tar" ]]; then
+                wget -q https://partner-images.canonical.com/core/bionic/current/ubuntu-bionic-core-cloudimg-amd64-root.tar.gz -O "$VM_DIR/$vm_name/rootfs.tar.gz"
+                tar -xzf "$VM_DIR/$vm_name/rootfs.tar.gz" -C "$rootfs"
             fi
             ;;
-        "size")
-            if ! [[ "$value" =~ ^[0-9]+[GgMm]$ ]]; then
-                print_status "ERROR" "Must be a size with unit (e.g., 100G, 512M)"
-                return 1
+        "alpine")
+            print_status "INFO" "Downloading Alpine Linux..."
+            if [[ ! -f "$VM_DIR/$vm_name/rootfs.tar" ]]; then
+                wget -q https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-minirootfs-3.18.0-x86_64.tar.gz -O "$VM_DIR/$vm_name/rootfs.tar.gz"
+                tar -xzf "$VM_DIR/$vm_name/rootfs.tar.gz" -C "$rootfs"
             fi
             ;;
-        "port")
-            if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 22 ] || [ "$value" -gt 65535 ]; then
-                print_status "ERROR" "Must be a valid port number (22-65535)"
-                return 1
-            fi
-            ;;
-        "name")
-            if ! [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-                print_status "ERROR" "VM name can only contain letters, numbers, hyphens, and underscores"
-                return 1
-            fi
-            ;;
-        "username")
-            if ! [[ "$value" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-                print_status "ERROR" "Username must start with a letter or underscore, and contain only letters, numbers, hyphens, and underscores"
-                return 1
-            fi
-            ;;
-        "password")
-            # Password bisa apa aja, termasuk titik dan karakter spesial
-            if [ -z "$value" ]; then
-                print_status "ERROR" "Password cannot be empty"
-                return 1
+        "debian")
+            print_status "INFO" "Downloading Debian base..."
+            if [[ ! -f "$VM_DIR/$vm_name/rootfs.tar" ]]; then
+                wget -q https://deb.debian.org/debian/pool/main/d/debootstrap/debootstrap_1.0.128_all.deb -O "$VM_DIR/$vm_name/debootstrap.deb"
+                dpkg -x "$VM_DIR/$vm_name/debootstrap.deb" "$VM_DIR/$vm_name/debootstrap"
+                "$VM_DIR/$vm_name/debootstrap/usr/sbin/debootstrap" --variant=minbase bookworm "$rootfs" 2>/dev/null || true
             fi
             ;;
     esac
-    return 0
-}
-
-# Function to check dependencies
-check_dependencies() {
-    local deps=("qemu-system-x86_64" "wget" "cloud-localds" "qemu-img")
-    local missing_deps=()
     
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            missing_deps+=("$dep")
-        fi
-    done
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        print_status "ERROR" "Missing dependencies: ${missing_deps[*]}"
-        print_status "INFO" "On Ubuntu/Debian, try: sudo apt install qemu-system cloud-image-utils wget"
-        exit 1
-    fi
-}
+    # Create startup script with proot
+    local start_script="$VM_DIR/$vm_name/start.sh"
+    cat > "$start_script" << 'EOF'
+#!/bin/bash
+PROOT="$HOME/bin/proot"
+ROOTFS="$1"
+shift
 
-# Function to cleanup temporary files
-cleanup() {
-    if [ -f "user-data" ]; then rm -f "user-data"; fi
-    if [ -f "meta-data" ]; then rm -f "meta-data"; fi
-}
-
-# Function to get all VM configurations
-get_vm_list() {
-    find "$VM_DIR" -name "*.conf" -exec basename {} .conf \; 2>/dev/null | sort
-}
-
-# Function to load VM configuration
-load_vm_config() {
-    local vm_name=$1
-    local config_file="$VM_DIR/$vm_name.conf"
-    
-    if [[ -f "$config_file" ]]; then
-        # Clear previous variables
-        unset VM_NAME OS_TYPE CODENAME IMG_URL HOSTNAME USERNAME PASSWORD
-        unset DISK_SIZE MEMORY CPUS SSH_PORT GUI_MODE PORT_FORWARDS IMG_FILE SEED_FILE CREATED
+# Run with proot to simulate root
+$PROOT \
+    -r "$ROOTFS" \
+    -b /proc \
+    -b /sys \
+    -b /dev \
+    -b /dev/pts \
+    -b /tmp \
+    -w /root \
+    /bin/bash -c "
+        # Setup environment
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export HOME=/root
+        export USER=root
         
-        source "$config_file"
+        # Create basic users if needed
+        if ! grep -q 'binder' /etc/passwd 2>/dev/null; then
+            echo 'binder:x:1000:1000:Binder User:/home/binder:/bin/bash' >> /etc/passwd
+            echo 'binder:x:1000:' >> /etc/group
+            mkdir -p /home/binder
+            chown 1000:1000 /home/binder
+        fi
+        
+        # You are now root!
+        echo '========================================'
+        echo 'You are NOW ROOT inside this environment'
+        echo '========================================'
+        cd /root
+        exec /bin/bash
+    "
+EOF
+    chmod +x "$start_script"
+    
+    echo "$start_script"
+}
+
+# Function to create namespace-based root
+setup_namespace_root() {
+    local vm_name=$1
+    
+    print_status "INFO" "Setting up user namespace with root privileges..."
+    
+    # Create new user namespace with root mapping
+    cat > "$VM_DIR/$vm_name/ns.sh" << 'EOF'
+#!/bin/bash
+# Setup user namespace with UID/GID mapping
+echo "Creating user namespace with UID mapping..."
+
+# Create mount namespace
+unshare -m -u -i -n -p -f --mount-proc bash << 'INNER'
+    # Remount root as private
+    mount --make-rprivate /
+    
+    # Create new mount namespace
+    mount -t tmpfs tmpfs /tmp
+    
+    # Setup basic filesystem
+    mkdir -p /proc /sys /dev /etc
+    
+    # Mount proc
+    mount -t proc proc /proc
+    
+    echo "=========================================="
+    echo "You are in a new namespace with fake root!"
+    echo "Commands that require root will work here"
+    echo "=========================================="
+    
+    # Create fake passwd with root
+    cat > /etc/passwd << PASSWD
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+PASSWD
+    
+    cat > /etc/group << GROUP
+root:x:0:
+daemon:x:1:
+bin:x:2:
+GROUP
+    
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export HOME=/root
+    
+    # Start shell
+    exec /bin/bash
+INNER
+EOF
+    chmod +x "$VM_DIR/$vm_name/ns.sh"
+    
+    echo "$VM_DIR/$vm_name/ns.sh"
+}
+
+# Function to create Docker container with root (if docker available)
+setup_docker_root() {
+    local vm_name=$1
+    local image=$2
+    
+    print_status "INFO" "Setting up Docker container with root access..."
+    
+    # Try to run docker with privileged flag
+    if docker info &>/dev/null; then
+        docker run -d \
+            --name "$vm_name" \
+            --privileged \
+            --user root \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+            "$image" \
+            sleep infinity
+        
+        echo "$vm_name"
         return 0
-    else
-        print_status "ERROR" "Configuration for VM '$vm_name' not found"
-        return 1
-    fi
-}
-
-# Function to save VM configuration
-save_vm_config() {
-    local config_file="$VM_DIR/$VM_NAME.conf"
-    
-    cat > "$config_file" <<EOF
-VM_NAME="$VM_NAME"
-OS_TYPE="$OS_TYPE"
-CODENAME="$CODENAME"
-IMG_URL="$IMG_URL"
-HOSTNAME="$HOSTNAME"
-USERNAME="$USERNAME"
-PASSWORD="$PASSWORD"
-DISK_SIZE="$DISK_SIZE"
-MEMORY="$MEMORY"
-CPUS="$CPUS"
-SSH_PORT="$SSH_PORT"
-GUI_MODE="$GUI_MODE"
-PORT_FORWARDS="$PORT_FORWARDS"
-IMG_FILE="$IMG_FILE"
-SEED_FILE="$SEED_FILE"
-CREATED="$CREATED"
-EOF
-    
-    print_status "SUCCESS" "Configuration saved to $config_file"
-}
-
-# Function to setup VM image (optimized for speed)
-setup_vm_image() {
-    print_status "INFO" "Preparing image..."
-    
-    # Create VM directory if it doesn't exist
-    mkdir -p "$VM_DIR"
-    
-    # Check if image already exists
-    if [[ -f "$IMG_FILE" ]]; then
-        print_status "INFO" "Image file already exists. Skipping download."
-    else
-        print_status "INFO" "Downloading image from $IMG_URL..."
-        if ! wget -q --show-progress "$IMG_URL" -O "$IMG_FILE.tmp"; then
-            print_status "ERROR" "Failed to download image from $IMG_URL"
-            exit 1
-        fi
-        mv "$IMG_FILE.tmp" "$IMG_FILE"
     fi
     
-    # Resize the disk image if needed
-    if ! qemu-img resize "$IMG_FILE" "$DISK_SIZE" 2>/dev/null; then
-        print_status "WARN" "Failed to resize disk image. Creating new image with specified size..."
-        rm -f "$IMG_FILE"
-        qemu-img create -f qcow2 -F qcow2 -b "$IMG_FILE" "$IMG_FILE.tmp" "$DISK_SIZE" 2>/dev/null || \
-        qemu-img create -f qcow2 "$IMG_FILE" "$DISK_SIZE"
-        if [ -f "$IMG_FILE.tmp" ]; then
-            mv "$IMG_FILE.tmp" "$IMG_FILE"
-        fi
-    fi
-
-    # cloud-init configuration
-    cat > user-data <<EOF
-#cloud-config
-hostname: $HOSTNAME
-manage_etc_hosts: true
-ssh_pwauth: true
-disable_root: false
-users:
-  - name: $USERNAME
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: false
-    passwd: $(echo "$PASSWORD" | openssl passwd -6 -stdin)
-chpasswd:
-  list: |
-    root:$PASSWORD
-    $USERNAME:$PASSWORD
-  expire: false
-package_update: true
-package_upgrade: false
-packages:
-  - qemu-guest-agent
-  - openssh-server
-runcmd:
-  - systemctl enable --now qemu-guest-agent
-  - systemctl enable --now ssh
-  - echo "VM setup complete" > /var/log/vm-setup.log
-EOF
-
-    cat > meta-data <<EOF
-instance-id: iid-$VM_NAME
-local-hostname: $HOSTNAME
-EOF
-
-    if ! cloud-localds "$SEED_FILE" user-data meta-data; then
-        print_status "ERROR" "Failed to create cloud-init seed image"
-        exit 1
-    fi
-    
-    print_status "SUCCESS" "VM '$VM_NAME' created successfully."
+    return 1
 }
 
 # Function to create new VM
 create_new_vm() {
-    print_status "INFO" "Creating a new VM"
+    print_status "INFO" "Creating new VM with sudo access"
     
-    # OS Selection
-    print_status "INFO" "Select an OS to set up:"
-    local os_options=()
-    local i=1
-    for os in "${!OS_OPTIONS[@]}"; do
-        echo "  $i) $os"
-        os_options[$i]="$os"
-        ((i++))
-    done
+    echo "Select method to get root access:"
+    echo "  1) PRoot (User-space root, most compatible)"
+    echo "  2) User Namespace (Faster, requires unshare)"
+    echo "  3) Docker (If available)"
+    echo "  4) Fake root (Simulated commands)"
     
-    while true; do
-        read -p "$(print_status "INPUT" "Enter your choice (1-${#OS_OPTIONS[@]}): ")" choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#OS_OPTIONS[@]} ]; then
-            local os="${os_options[$choice]}"
-            IFS='|' read -r OS_TYPE CODENAME IMG_URL DEFAULT_HOSTNAME DEFAULT_USERNAME DEFAULT_PASSWORD <<< "${OS_OPTIONS[$os]}"
-            break
+    read -p "$(print_status "INPUT" "Choice (1-4): ")" method
+    
+    read -p "$(print_status "INPUT" "Enter VM name: ")" VM_NAME
+    
+    if [[ "$method" == "1" ]]; then
+        echo "Select distribution:"
+        echo "  1) Ubuntu"
+        echo "  2) Alpine (small)"
+        echo "  3) Debian"
+        read -p "Choice: " distro_choice
+        
+        case $distro_choice in
+            1) distro="ubuntu" ;;
+            2) distro="alpine" ;;
+            3) distro="debian" ;;
+            *) distro="alpine" ;;
+        esac
+        
+        local script=$(setup_proot_env "$VM_NAME" "$distro")
+        
+        # Save config
+        cat > "$VM_DIR/$VM_NAME.conf" <<EOF
+VM_NAME="$VM_NAME"
+METHOD="proot"
+DISTRO="$distro"
+SCRIPT="$script"
+CREATED="$(date)"
+EOF
+        
+        print_status "SUCCESS" "VM created! Start it to get root access"
+        
+    elif [[ "$method" == "2" ]]; then
+        local script=$(setup_namespace_root "$VM_NAME")
+        
+        cat > "$VM_DIR/$VM_NAME.conf" <<EOF
+VM_NAME="$VM_NAME"
+METHOD="namespace"
+SCRIPT="$script"
+CREATED="$(date)"
+EOF
+        
+        print_status "SUCCESS" "Namespace VM created!"
+        
+    elif [[ "$method" == "3" ]] && command -v docker &>/dev/null; then
+        read -p "$(print_status "INPUT" "Docker image (default: ubuntu:22.04): ")" image
+        image="${image:-ubuntu:22.04}"
+        
+        if setup_docker_root "$VM_NAME" "$image"; then
+            cat > "$VM_DIR/$VM_NAME.conf" <<EOF
+VM_NAME="$VM_NAME"
+METHOD="docker"
+IMAGE="$image"
+CREATED="$(date)"
+EOF
+            print_status "SUCCESS" "Docker container created with root!"
         else
-            print_status "ERROR" "Invalid selection. Try again."
+            print_status "ERROR" "Failed to create Docker container"
         fi
-    done
-
-    # Custom Inputs with validation
-    while true; do
-        read -p "$(print_status "INPUT" "Enter VM name (default: $DEFAULT_HOSTNAME): ")" VM_NAME
-        VM_NAME="${VM_NAME:-$DEFAULT_HOSTNAME}"
-        if validate_input "name" "$VM_NAME"; then
-            if [[ -f "$VM_DIR/$VM_NAME.conf" ]]; then
-                print_status "ERROR" "VM with name '$VM_NAME' already exists"
-            else
-                break
-            fi
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Enter hostname (default: $VM_NAME): ")" HOSTNAME
-        HOSTNAME="${HOSTNAME:-$VM_NAME}"
-        if validate_input "name" "$HOSTNAME"; then
-            break
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Enter username (default: $DEFAULT_USERNAME): ")" USERNAME
-        USERNAME="${USERNAME:-$DEFAULT_USERNAME}"
-        if validate_input "username" "$USERNAME"; then
-            break
-        fi
-    done
-
-    # Password bisa apa aja, termasuk . dan karakter spesial
-    while true; do
-        read -s -p "$(print_status "INPUT" "Enter password (default: $DEFAULT_PASSWORD): ")" PASSWORD
-        PASSWORD="${PASSWORD:-$DEFAULT_PASSWORD}"
-        echo
-        if validate_input "password" "$PASSWORD"; then
-            break
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Disk size (default: 20G): ")" DISK_SIZE
-        DISK_SIZE="${DISK_SIZE:-20G}"
-        if validate_input "size" "$DISK_SIZE"; then
-            break
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Memory in MB (default: 2048): ")" MEMORY
-        MEMORY="${MEMORY:-2048}"
-        if validate_input "number" "$MEMORY"; then
-            break
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Number of CPUs (default: 2): ")" CPUS
-        CPUS="${CPUS:-2}"
-        if validate_input "number" "$CPUS"; then
-            break
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "SSH Port (default: 2222): ")" SSH_PORT
-        SSH_PORT="${SSH_PORT:-2222}"
-        if validate_input "port" "$SSH_PORT"; then
-            # Check if port is already in use
-            if ss -tln 2>/dev/null | grep -q ":$SSH_PORT "; then
-                print_status "ERROR" "Port $SSH_PORT is already in use"
-            else
-                break
-            fi
-        fi
-    done
-
-    while true; do
-        read -p "$(print_status "INPUT" "Enable GUI mode? (y/n, default: n): ")" gui_input
-        GUI_MODE=false
-        gui_input="${gui_input:-n}"
-        if [[ "$gui_input" =~ ^[Yy]$ ]]; then 
-            GUI_MODE=true
-            break
-        elif [[ "$gui_input" =~ ^[Nn]$ ]]; then
-            break
-        else
-            print_status "ERROR" "Please answer y or n"
-        fi
-    done
-
-    # Additional network options
-    read -p "$(print_status "INPUT" "Additional port forwards (e.g., 8080:80, press Enter for none): ")" PORT_FORWARDS
-
-    IMG_FILE="$VM_DIR/$VM_NAME.img"
-    SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"
-    CREATED="$(date)"
-
-    # Download and setup VM image
-    setup_vm_image
-    
-    # Save configuration
-    save_vm_config
+        
+    else
+        # Fake root simulation
+        mkdir -p "$FAKEROOT_DIR/$VM_NAME"
+        
+        cat > "$VM_DIR/$VM_NAME.conf" <<EOF
+VM_NAME="$VM_NAME"
+METHOD="fakeroot"
+FAKEROOT_DIR="$FAKEROOT_DIR/$VM_NAME"
+CREATED="$(date)"
+EOF
+        
+        print_status "SUCCESS" "Fake root environment created"
+    fi
 }
 
-# Function to start a VM (optimized for fast boot)
+# Function to start VM
 start_vm() {
     local vm_name=$1
+    local config_file="$VM_DIR/$vm_name.conf"
     
-    if load_vm_config "$vm_name"; then
-        print_status "INFO" "Starting VM: $vm_name"
-        print_status "INFO" "SSH: ssh -p $SSH_PORT $USERNAME@localhost"
-        print_status "INFO" "Password: $PASSWORD"
-        
-        # Check if image file exists
-        if [[ ! -f "$IMG_FILE" ]]; then
-            print_status "ERROR" "VM image file not found: $IMG_FILE"
-            return 1
-        fi
-        
-        # Check if seed file exists
-        if [[ ! -f "$SEED_FILE" ]]; then
-            print_status "WARN" "Seed file not found, recreating..."
-            setup_vm_image
-        fi
-        
-        # Kill any existing QEMU process for this VM
-        if pgrep -f "qemu-system-x86_64.*$vm_name" >/dev/null; then
-            print_status "WARN" "VM $vm_name is already running, stopping it first..."
-            stop_vm "$vm_name"
-            sleep 1
-        fi
-        
-        # Base QEMU command - optimized for speed
-        local qemu_cmd=(
-            qemu-system-x86_64
-            -name "$vm_name"
-            -enable-kvm
-            -machine type=q35,accel=kvm
-            -cpu host
-            -smp "$CPUS"
-            -m "$MEMORY"
-            -drive "file=$IMG_FILE,format=qcow2,if=virtio,aio=native,cache=none"
-            -drive "file=$SEED_FILE,format=raw,if=virtio"
-            -boot order=c
-            -netdev user,id=net0,hostfwd=tcp::$SSH_PORT-:22
-            -device virtio-net-pci,netdev=net0
-            -device virtio-balloon-pci
-            -object rng-random,filename=/dev/urandom,id=rng0
-            -device virtio-rng-pci,rng=rng0
-            -no-hpet
-            -rtc base=localtime,driftfix=slew
-        )
-
-        # Add port forwards if specified
-        if [[ -n "$PORT_FORWARDS" ]]; then
-            IFS=',' read -ra forwards <<< "$PORT_FORWARDS"
-            for forward in "${forwards[@]}"; do
-                IFS=':' read -r host_port guest_port <<< "$forward"
-                qemu_cmd+=(-netdev "user,id=net${#qemu_cmd[@]},hostfwd=tcp::$host_port-:$guest_port")
-                qemu_cmd+=(-device "virtio-net-pci,netdev=net${#qemu_cmd[@]}")
-            done
-        fi
-
-        # Add GUI or console mode
-        if [[ "$GUI_MODE" == true ]]; then
-            qemu_cmd+=(-vga virtio -display gtk,gl=on)
-        else
-            qemu_cmd+=(-nographic -serial mon:stdio)
-        fi
-
-        print_status "INFO" "Starting QEMU (optimized for fast boot)..."
-        
-        # Run in background if GUI mode, foreground if console
-        if [[ "$GUI_MODE" == true ]]; then
-            "${qemu_cmd[@]}" &
-            echo $! > "$VM_DIR/$vm_name.pid"
-            print_status "SUCCESS" "VM $vm_name started with PID $(cat "$VM_DIR/$vm_name.pid")"
-        else
-            "${qemu_cmd[@]}"
-        fi
+    if [[ ! -f "$config_file" ]]; then
+        print_status "ERROR" "VM not found"
+        return 1
     fi
+    
+    source "$config_file"
+    
+    case $METHOD in
+        "proot")
+            print_status "INFO" "Starting PRoot environment (you will have root!)..."
+            "$SCRIPT" "$VM_DIR/$vm_name/rootfs"
+            ;;
+        "namespace")
+            print_status "INFO" "Starting namespace environment..."
+            "$SCRIPT"
+            ;;
+        "docker")
+            print_status "INFO" "Starting Docker container..."
+            docker start -ai "$VM_NAME"
+            ;;
+        "fakeroot")
+            print_status "INFO" "Starting fake root environment..."
+            cd "$FAKEROOT_DIR"
+            fakeroot /bin/bash -c "
+                echo '========================================'
+                echo 'Fake root environment - sudo simulated!'
+                echo '========================================'
+                export PS1='fake-root# '
+                exec /bin/bash
+            "
+            ;;
+    esac
 }
 
-# Function to delete a VM
-delete_vm() {
+# Function to run commands with sudo in VM
+run_with_sudo() {
     local vm_name=$1
+    shift
+    local cmd="$@"
     
-    print_status "WARN" "This will permanently delete VM '$vm_name' and all its data!"
-    read -p "$(print_status "INPUT" "Are you sure? (y/N): ")" -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if load_vm_config "$vm_name"; then
-            rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm_name.conf"
-            print_status "SUCCESS" "VM '$vm_name' has been deleted"
+    local config_file="$VM_DIR/$vm_name.conf"
+    source "$config_file"
+    
+    case $METHOD in
+        "proot")
+            "$SCRIPT" "$VM_DIR/$vm_name/rootfs" -c "$cmd"
+            ;;
+        "namespace")
+            "$VM_DIR/$vm_name/ns.sh" -c "$cmd"
+            ;;
+        "docker")
+            docker exec "$VM_NAME" $cmd
+            ;;
+        "fakeroot")
+            fakeroot $cmd
+            ;;
+    esac
+}
+
+# Function to list VMs
+list_vms() {
+    echo "Available VMs with sudo access:"
+    local i=1
+    for config in "$VM_DIR"/*.conf 2>/dev/null; do
+        if [[ -f "$config" ]]; then
+            source "$config"
+            local status="Stopped"
+            
+            case $METHOD in
+                "docker")
+                    if docker ps -q -f name="$VM_NAME" | grep -q .; then
+                        status="Running"
+                    fi
+                    ;;
+                *)
+                    if [[ -f "$VM_DIR/$VM_NAME.pid" ]] && kill -0 $(cat "$VM_DIR/$VM_NAME.pid") 2>/dev/null; then
+                        status="Running"
+                    fi
+                    ;;
+            esac
+            
+            printf "  %2d) %-20s [%s] (%s)\n" $i "$VM_NAME" "$METHOD" "$status"
+            ((i++))
         fi
-    else
-        print_status "INFO" "Deletion cancelled"
-    fi
-}
-
-# Function to show VM info
-show_vm_info() {
-    local vm_name=$1
+    done
     
-    if load_vm_config "$vm_name"; then
-        echo
-        print_status "INFO" "VM Information: $vm_name"
-        echo "=========================================="
-        echo "OS: $OS_TYPE"
-        echo "Hostname: $HOSTNAME"
-        echo "Username: $USERNAME"
-        echo "Password: $PASSWORD"
-        echo "SSH Port: $SSH_PORT"
-        echo "Memory: $MEMORY MB"
-        echo "CPUs: $CPUS"
-        echo "Disk: $DISK_SIZE"
-        echo "GUI Mode: $GUI_MODE"
-        echo "Port Forwards: ${PORT_FORWARDS:-None}"
-        echo "Created: $CREATED"
-        echo "Image File: $IMG_FILE"
-        echo "Seed File: $SEED_FILE"
-        echo "=========================================="
-        echo
-        read -p "$(print_status "INPUT" "Press Enter to continue...")"
-    fi
-}
-
-# Function to check if VM is running
-is_vm_running() {
-    local vm_name=$1
-    if pgrep -f "qemu-system-x86_64.*$vm_name" >/dev/null; then
-        return 0
-    else
+    if [[ $i -eq 1 ]]; then
+        print_status "INFO" "No VMs found"
         return 1
     fi
 }
 
-# Function to stop a running VM
-stop_vm() {
-    local vm_name=$1
-    
-    if load_vm_config "$vm_name"; then
-        if is_vm_running "$vm_name"; then
-            print_status "INFO" "Stopping VM: $vm_name"
-            
-            # Try graceful shutdown via monitor
-            if [[ -f "$VM_DIR/$vm_name.pid" ]]; then
-                local pid=$(cat "$VM_DIR/$vm_name.pid" 2>/dev/null)
-                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                    kill "$pid" 2>/dev/null || true
-                    sleep 1
-                fi
-            fi
-            
-            # Force kill if still running
-            if is_vm_running "$vm_name"; then
-                pkill -f "qemu-system-x86_64.*$vm_name" 2>/dev/null || true
-            fi
-            
-            rm -f "$VM_DIR/$vm_name.pid"
-            print_status "SUCCESS" "VM $vm_name stopped"
-        else
-            print_status "INFO" "VM $vm_name is not running"
-        fi
-    fi
-}
-
-# Function to edit VM configuration
-edit_vm_config() {
-    local vm_name=$1
-    
-    if load_vm_config "$vm_name"; then
-        print_status "INFO" "Editing VM: $vm_name"
-        
-        while true; do
-            echo "What would you like to edit?"
-            echo "  1) Hostname"
-            echo "  2) Username"
-            echo "  3) Password (any characters allowed)"
-            echo "  4) SSH Port"
-            echo "  5) GUI Mode"
-            echo "  6) Port Forwards"
-            echo "  7) Memory (RAM)"
-            echo "  8) CPU Count"
-            echo "  9) Disk Size"
-            echo "  0) Back to main menu"
-            
-            read -p "$(print_status "INPUT" "Enter your choice: ")" edit_choice
-            
-            case $edit_choice in
-                1)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new hostname (current: $HOSTNAME): ")" new_hostname
-                        new_hostname="${new_hostname:-$HOSTNAME}"
-                        if validate_input "name" "$new_hostname"; then
-                            HOSTNAME="$new_hostname"
-                            break
-                        fi
-                    done
-                    ;;
-                2)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new username (current: $USERNAME): ")" new_username
-                        new_username="${new_username:-$USERNAME}"
-                        if validate_input "username" "$new_username"; then
-                            USERNAME="$new_username"
-                            break
-                        fi
-                    done
-                    ;;
-                3)
-                    while true; do
-                        read -s -p "$(print_status "INPUT" "Enter new password (current: ****): ")" new_password
-                        new_password="${new_password:-$PASSWORD}"
-                        echo
-                        if validate_input "password" "$new_password"; then
-                            PASSWORD="$new_password"
-                            break
-                        fi
-                    done
-                    ;;
-                4)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new SSH port (current: $SSH_PORT): ")" new_ssh_port
-                        new_ssh_port="${new_ssh_port:-$SSH_PORT}"
-                        if validate_input "port" "$new_ssh_port"; then
-                            # Check if port is already in use
-                            if [ "$new_ssh_port" != "$SSH_PORT" ] && ss -tln 2>/dev/null | grep -q ":$new_ssh_port "; then
-                                print_status "ERROR" "Port $new_ssh_port is already in use"
-                            else
-                                SSH_PORT="$new_ssh_port"
-                                break
-                            fi
-                        fi
-                    done
-                    ;;
-                5)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enable GUI mode? (y/n, current: $GUI_MODE): ")" gui_input
-                        gui_input="${gui_input:-}"
-                        if [[ "$gui_input" =~ ^[Yy]$ ]]; then 
-                            GUI_MODE=true
-                            break
-                        elif [[ "$gui_input" =~ ^[Nn]$ ]]; then
-                            GUI_MODE=false
-                            break
-                        elif [ -z "$gui_input" ]; then
-                            break
-                        else
-                            print_status "ERROR" "Please answer y or n"
-                        fi
-                    done
-                    ;;
-                6)
-                    read -p "$(print_status "INPUT" "Additional port forwards (current: ${PORT_FORWARDS:-None}): ")" new_port_forwards
-                    PORT_FORWARDS="${new_port_forwards:-$PORT_FORWARDS}"
-                    ;;
-                7)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new memory in MB (current: $MEMORY): ")" new_memory
-                        new_memory="${new_memory:-$MEMORY}"
-                        if validate_input "number" "$new_memory"; then
-                            MEMORY="$new_memory"
-                            break
-                        fi
-                    done
-                    ;;
-                8)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new CPU count (current: $CPUS): ")" new_cpus
-                        new_cpus="${new_cpus:-$CPUS}"
-                        if validate_input "number" "$new_cpus"; then
-                            CPUS="$new_cpus"
-                            break
-                        fi
-                    done
-                    ;;
-                9)
-                    while true; do
-                        read -p "$(print_status "INPUT" "Enter new disk size (current: $DISK_SIZE): ")" new_disk_size
-                        new_disk_size="${new_disk_size:-$DISK_SIZE}"
-                        if validate_input "size" "$new_disk_size"; then
-                            DISK_SIZE="$new_disk_size"
-                            break
-                        fi
-                    done
-                    ;;
-                0)
-                    return 0
-                    ;;
-                *)
-                    print_status "ERROR" "Invalid selection"
-                    continue
-                    ;;
-            esac
-            
-            # Recreate seed image with new configuration if user/password/hostname changed
-            if [[ "$edit_choice" -eq 1 || "$edit_choice" -eq 2 || "$edit_choice" -eq 3 ]]; then
-                print_status "INFO" "Updating cloud-init configuration..."
-                setup_vm_image
-            fi
-            
-            # Save configuration
-            save_vm_config
-            
-            read -p "$(print_status "INPUT" "Continue editing? (y/N): ")" continue_editing
-            if [[ ! "$continue_editing" =~ ^[Yy]$ ]]; then
-                break
-            fi
-        done
-    fi
-}
-
-# Function to resize VM disk
-resize_vm_disk() {
-    local vm_name=$1
-    
-    if load_vm_config "$vm_name"; then
-        print_status "INFO" "Current disk size: $DISK_SIZE"
-        
-        while true; do
-            read -p "$(print_status "INPUT" "Enter new disk size (e.g., 50G): ")" new_disk_size
-            if validate_input "size" "$new_disk_size"; then
-                if [[ "$new_disk_size" == "$DISK_SIZE" ]]; then
-                    print_status "INFO" "New disk size is the same as current size. No changes made."
-                    return 0
-                fi
-                
-                # Resize the disk
-                print_status "INFO" "Resizing disk to $new_disk_size..."
-                if qemu-img resize "$IMG_FILE" "$new_disk_size"; then
-                    DISK_SIZE="$new_disk_size"
-                    save_vm_config
-                    print_status "SUCCESS" "Disk resized successfully to $new_disk_size"
-                else
-                    print_status "ERROR" "Failed to resize disk"
-                    return 1
-                fi
-                break
-            fi
-        done
-    fi
-}
-
-# Function to show VM performance metrics
-show_vm_performance() {
-    local vm_name=$1
-    
-    if load_vm_config "$vm_name"; then
-        if is_vm_running "$vm_name"; then
-            print_status "INFO" "Performance metrics for VM: $vm_name"
-            echo "=========================================="
-            
-            # Get QEMU process ID
-            local qemu_pid=$(pgrep -f "qemu-system-x86_64.*$vm_name" | head -1)
-            if [[ -n "$qemu_pid" ]]; then
-                # Show process stats
-                echo "QEMU Process Stats:"
-                ps -p "$qemu_pid" -o pid,%cpu,%mem,sz,rss,vsz,args --no-headers 2>/dev/null || echo "Process not found"
-                echo
-                
-                # Show memory usage
-                echo "Memory Usage:"
-                free -h
-                echo
-                
-                # Show disk usage
-                echo "Disk Usage:"
-                df -h "$IMG_FILE" 2>/dev/null || du -h "$IMG_FILE"
-            else
-                print_status "ERROR" "Could not find QEMU process for VM $vm_name"
-            fi
-        else
-            print_status "INFO" "VM $vm_name is not running"
-            echo "Configuration:"
-            echo "  Memory: $MEMORY MB"
-            echo "  CPUs: $CPUS"
-            echo "  Disk: $DISK_SIZE"
-        fi
-        echo "=========================================="
-        read -p "$(print_status "INPUT" "Press Enter to continue...")"
-    fi
-}
-
-# Main menu function
+# Main menu
 main_menu() {
+    # Setup fake sudo
+    mkdir -p "$HOME/bin"
+    install_fake_sudo
+    
     while true; do
         display_header
         
-        local vms=($(get_vm_list))
-        local vm_count=${#vms[@]}
-        
-        if [ $vm_count -gt 0 ]; then
-            print_status "INFO" "Found $vm_count existing VM(s):"
-            for i in "${!vms[@]}"; do
-                local status="Stopped"
-                if is_vm_running "${vms[$i]}"; then
-                    status="Running"
-                fi
-                printf "  %2d) %s (%s)\n" $((i+1)) "${vms[$i]}" "$status"
-            done
-            echo
-        fi
-        
-        echo "Main Menu:"
-        echo "  1) Create a new VM"
-        if [ $vm_count -gt 0 ]; then
-            echo "  2) Start a VM"
-            echo "  3) Stop a VM"
-            echo "  4) Show VM info"
-            echo "  5) Edit VM configuration"
-            echo "  6) Delete a VM"
-            echo "  7) Resize VM disk"
-            echo "  8) Show VM performance"
-        fi
+        echo "Main Menu (with SUDO support):"
+        echo "  1) Create new VM with root access"
+        echo "  2) List VMs"
+        echo "  3) Start VM (get root shell)"
+        echo "  4) Run command with sudo in VM"
+        echo "  5) Install packages in VM"
+        echo "  6) Stop VM"
+        echo "  7) Delete VM"
+        echo "  8) Test sudo access"
         echo "  0) Exit"
         echo
         
-        read -p "$(print_status "INPUT" "Enter your choice: ")" choice
+        read -p "$(print_status "INPUT" "Choice: ")" choice
         
         case $choice in
             1)
                 create_new_vm
+                read -p "Press Enter..."
                 ;;
             2)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to start: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        start_vm "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
-                    fi
-                fi
+                list_vms
+                read -p "Press Enter..."
                 ;;
             3)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to stop: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        stop_vm "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
+                if list_vms; then
+                    read -p "$(print_status "INPUT" "Enter VM number: ")" num
+                    local vm_name=$(ls "$VM_DIR"/*.conf 2>/dev/null | sed -n "${num}p" | xargs basename | sed 's/\.conf$//')
+                    if [[ -n "$vm_name" ]]; then
+                        start_vm "$vm_name"
                     fi
                 fi
                 ;;
             4)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to show info: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        show_vm_info "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
+                if list_vms; then
+                    read -p "$(print_status "INPUT" "Enter VM number: ")" num
+                    local vm_name=$(ls "$VM_DIR"/*.conf 2>/dev/null | sed -n "${num}p" | xargs basename | sed 's/\.conf$//')
+                    if [[ -n "$vm_name" ]]; then
+                        read -p "$(print_status "INPUT" "Command to run with sudo: ")" cmd
+                        run_with_sudo "$vm_name" $cmd
                     fi
                 fi
+                read -p "Press Enter..."
                 ;;
             5)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to edit: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        edit_vm_config "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
+                if list_vms; then
+                    read -p "$(print_status "INPUT" "Enter VM number: ")" num
+                    local vm_name=$(ls "$VM_DIR"/*.conf 2>/dev/null | sed -n "${num}p" | xargs basename | sed 's/\.conf$//')
+                    if [[ -n "$vm_name" ]]; then
+                        read -p "$(print_status "INPUT" "Package to install: ")" pkg
+                        run_with_sudo "$vm_name" apt-get update
+                        run_with_sudo "$vm_name" apt-get install -y "$pkg"
                     fi
                 fi
+                read -p "Press Enter..."
                 ;;
             6)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to delete: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        delete_vm "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
+                if list_vms; then
+                    read -p "$(print_status "INPUT" "Enter VM number: ")" num
+                    local vm_name=$(ls "$VM_DIR"/*.conf 2>/dev/null | sed -n "${num}p" | xargs basename | sed 's/\.conf$//')
+                    if [[ -n "$vm_name" ]]; then
+                        source "$VM_DIR/$vm_name.conf"
+                        if [[ "$METHOD" == "docker" ]]; then
+                            docker stop "$vm_name"
+                        else
+                            # Kill process
+                            if [[ -f "$VM_DIR/$vm_name.pid" ]]; then
+                                kill $(cat "$VM_DIR/$vm_name.pid") 2>/dev/null || true
+                                rm -f "$VM_DIR/$vm_name.pid"
+                            fi
+                        fi
+                        print_status "SUCCESS" "VM stopped"
                     fi
                 fi
+                read -p "Press Enter..."
                 ;;
             7)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to resize disk: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        resize_vm_disk "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
+                if list_vms; then
+                    read -p "$(print_status "INPUT" "Enter VM number to delete: ")" num
+                    local vm_name=$(ls "$VM_DIR"/*.conf 2>/dev/null | sed -n "${num}p" | xargs basename | sed 's/\.conf$//')
+                    if [[ -n "$vm_name" ]]; then
+                        rm -f "$VM_DIR/$vm_name.conf"
+                        rm -rf "$VM_DIR/$vm_name"
+                        print_status "SUCCESS" "VM deleted"
                     fi
                 fi
+                read -p "Press Enter..."
                 ;;
             8)
-                if [ $vm_count -gt 0 ]; then
-                    read -p "$(print_status "INPUT" "Enter VM number to show performance: ")" vm_num
-                    if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        show_vm_performance "${vms[$((vm_num-1))]}"
-                    else
-                        print_status "ERROR" "Invalid selection"
-                    fi
+                print_status "INFO" "Testing sudo access..."
+                echo "Current user: $(whoami)"
+                echo "Can we fake root? Let's try:"
+                
+                if command -v fakeroot &>/dev/null; then
+                    fakeroot whoami
+                    echo "Fakeroot working!"
                 fi
+                
+                if command -v proot &>/dev/null; then
+                    proot whoami
+                    echo "PRoot working!"
+                fi
+                
+                read -p "Press Enter..."
                 ;;
             0)
                 print_status "INFO" "Goodbye!"
                 exit 0
                 ;;
-            *)
-                print_status "ERROR" "Invalid option"
-                ;;
         esac
-        
-        read -p "$(print_status "INPUT" "Press Enter to continue...")"
     done
 }
 
-# Set trap to cleanup on exit
-trap cleanup EXIT
-
-# Check dependencies
-check_dependencies
-
-# Initialize paths
-VM_DIR="${VM_DIR:-$HOME/vms}"
+# Create necessary directories
+mkdir -p "$HOME/bin"
 mkdir -p "$VM_DIR"
 
-# Supported OS list
-declare -A OS_OPTIONS=(
-    ["Ubuntu 22.04"]="ubuntu|jammy|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img|ubuntu22|ubuntu|ubuntu"
-    ["Ubuntu 24.04"]="ubuntu|noble|https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img|ubuntu24|ubuntu|ubuntu"
-    ["Debian 11"]="debian|bullseye|https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2|debian11|debian|debian"
-    ["Debian 12"]="debian|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2|debian12|debian|debian"
-    ["Fedora 40"]="fedora|40|https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-40-1.14.x86_64.qcow2|fedora40|fedora|fedora"
-    ["CentOS Stream 9"]="centos|stream9|https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2|centos9|centos|centos"
-    ["AlmaLinux 9"]="almalinux|9|https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2|almalinux9|alma|alma"
-    ["Rocky Linux 9"]="rockylinux|9|https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2|rocky9|rocky|rocky"
-)
-
-# Start the main menu
+# Start
 main_menu
